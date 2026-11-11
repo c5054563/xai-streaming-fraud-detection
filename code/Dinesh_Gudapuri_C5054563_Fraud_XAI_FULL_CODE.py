@@ -1,0 +1,336 @@
+# Dinesh Gudapuri (C5054563) - XAI-Guided Drift-Adaptive Streaming Fraud Detection
+# Standalone full code: library install, helper package, dataset download + load, EDA, cleansing,
+# features, stream simulation, drift, baselines, tuning, evaluation, model save. No outputs.
+# Open in VS Code and click "Run Cell" above each # %% block, top to bottom.
+
+# %% Cell 1
+# Step 0a: install the libraries (run once)
+# In a terminal run: pip install numpy pandas pyarrow scikit-learn river shap matplotlib ipykernel
+
+# %% Cell 2
+# Step 0b: write the project helper package (src/fraudxai) next to this file so everything is in one file
+from pathlib import Path
+ROOT0 = Path.cwd().resolve().parent if Path.cwd().name == "notebooks" else Path.cwd().resolve()
+PKG = ROOT0 / "src" / "fraudxai"; PKG.mkdir(parents=True, exist_ok=True)
+MODULES = {
+    '__init__.py': '"""fraudxai: XAI-guided, drift-adaptive streaming fraud detection (MSc project, Dinesh Gudapuri, C5054563)."""\n__version__ = "0.1.0"\n',
+    'cleansing.py': '"""Data audit, validation rules and cleansing (report Section 3.20, objective O1).\n\nEach rule returns a small record (id, rule, violations, action) so the notebook can show a\ndata-audit table and the unit tests can check every rule on tiny hand-made tables.\n"""\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass, asdict\n\nimport numpy as np\nimport pandas as pd\n\nfrom . import config\n\n\n@dataclass\nclass RuleResult:\n    rule_id: str\n    rule: str\n    violations: int\n    action: str\n\n    def as_dict(self) -> dict:\n        return asdict(self)\n\n\ndef audit_table(df: pd.DataFrame) -> pd.DataFrame:\n    """Column-level audit: type, missing, unique values, min, max."""\n    rows = []\n    for c in df.columns:\n        s = df[c]\n        rows.append({\n            "column": c,\n            "dtype": str(s.dtype),\n            "missing": int(s.isna().sum()),\n            "unique": int(s.nunique()),\n            "min": float(s.min()),\n            "max": float(s.max()),\n        })\n    return pd.DataFrame(rows)\n\n\ndef validate(df: pd.DataFrame) -> list[RuleResult]:\n    """Apply validation rules R1-R9 and count violations (nothing is changed here)."""\n    feats = [c for c in df.columns if c != config.TARGET]\n    num = df[feats].apply(pd.to_numeric, errors="coerce")\n    return [\n        RuleResult("R1", "Schema: 31 expected columns present",\n                   len(set(config.RAW_COLS) ^ set(df.columns)), "stop if > 0"),\n        RuleResult("R2", "All features numeric (float)",\n                   int((num.isna() & df[feats].notna()).sum().sum()), "stop if > 0"),\n        RuleResult("R3", "No missing values",\n                   int(df.isna().sum().sum()), "stop if > 0"),\n        RuleResult("R4", "Class in {0, 1}",\n                   int((~df[config.TARGET].isin([0, 1])).sum()), "stop if > 0"),\n        RuleResult("R5", "0 <= Time <= 172,800 s and non-decreasing",\n                   int(((df["Time"] < 0) | (df["Time"] > config.MAX_TIME_S)).sum()\n                       + (df["Time"].diff().fillna(0) < 0).sum()), "sort by Time if > 0"),\n        RuleResult("R6", "Amount >= 0",\n                   int((df["Amount"] < 0).sum()), "stop if > 0"),\n        RuleResult("R7", "V1-V28 and Amount finite",\n                   int((~np.isfinite(num[config.V_COLS + ["Amount"]])).sum().sum()), "stop if > 0"),\n        RuleResult("R8", "Exact duplicate rows",\n                   int(df.duplicated().sum()), "drop, keep first"),\n        RuleResult("R9", "Amount == 0 (zero-value transactions)",\n                   int((df["Amount"] == 0).sum()), "keep (valid value), flag"),\n    ]\n\n\ndef clean(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:\n    """Cleansing: enforce time order (stable), drop exact duplicates, reset the index."""\n    n0, f0 = len(df), int(df[config.TARGET].sum())\n    out = df.sort_values("Time", kind="stable")\n    out = out.drop_duplicates(keep="first").reset_index(drop=True)\n    log = {\n        "rows_before": n0, "fraud_before": f0,\n        "rows_after": len(out), "fraud_after": int(out[config.TARGET].sum()),\n        "duplicates_dropped": n0 - len(out),\n        "fraud_duplicates_dropped": f0 - int(out[config.TARGET].sum()),\n    }\n    return out, log\n',
+    'config.py': '"""Central configuration so the notebook, tests and Streamlit app share one set of settings."""\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[2]\nDATA_DIR = ROOT / "data"\nRESULTS_DIR = ROOT / "results"\nOPENML_ID = 1597\nOPENML_PARQUET_URL = "https://data.openml.org/datasets/0000/1597/dataset_1597.pq"\nKAGGLE_URL = "https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"\nDATA_FILE = DATA_DIR / "creditcard.parquet"\n\nV_COLS = [f"V{i}" for i in range(1, 29)]\nRAW_COLS = ["Time"] + V_COLS + ["Amount", "Class"]\nTARGET = "Class"\nEXPECTED_ROWS = 284_807\nEXPECTED_FRAUD = 492\nMAX_TIME_S = 172_800          # the dataset covers two days (48 h) of September 2013\n\nSEEDS = [0, 1, 2, 3, 4]       # >= 5 seeds (UREC2)\nWARMUP_FRACTION = 0.20        # early, time-ordered slice used only for tuning\nTHRESHOLD = 0.5               # decision threshold used for G-mean\nPK_BLOCK = 10_000             # alert budget: k alerts per block of transactions\nPK_K = 10                     # k = 10 per 10,000 (0.1 % budget, below the 0.172 % fraud rate)\n',
+    'data.py': '"""Download and load the ULB/Worldline credit card dataset (Dal Pozzolo et al.).\n\nSource: Kaggle mlg-ulb/creditcardfraud (ODbL v1.0 / DbCL v1.0); mirror used here: OpenML id 1597.\nThe raw file is stored in data/ and is never committed (see .gitignore).\n"""\nfrom __future__ import annotations\n\nimport hashlib\nimport urllib.request\nfrom pathlib import Path\n\nimport pandas as pd\n\nfrom . import config\n\n\ndef download(dest: Path = config.DATA_FILE, url: str = config.OPENML_PARQUET_URL) -> Path:\n    """Download the OpenML parquet copy if it is not already present."""\n    dest.parent.mkdir(parents=True, exist_ok=True)\n    if not dest.exists():\n        urllib.request.urlretrieve(url, dest)\n    return dest\n\n\ndef md5(path: Path) -> str:\n    h = hashlib.md5()\n    with open(path, "rb") as f:\n        for chunk in iter(lambda: f.read(1 << 20), b""):\n            h.update(chunk)\n    return h.hexdigest()\n\n\ndef load(path: Path = config.DATA_FILE) -> pd.DataFrame:\n    """Load the raw table with the original column order; Class as int (0 legit, 1 fraud)."""\n    df = pd.read_parquet(path)\n    df["Class"] = df["Class"].astype(int)\n    return df[config.RAW_COLS]\n',
+    'detectors.py': '"""Proposed XAI-guided drift detector (objective O4): ADWIN on windowed TreeSHAP attributions.\n\nExtends Shap-ADWIN (Zimmermann & Boussard, 2022) to a fraud stream with delayed labels: the\nsignal needs NO labels. A tree model (fitted on labelled warm-up data) is explained with\nTreeSHAP on every `sample_every`-th incoming transaction. For each explained transaction the\nsignal is the relative L1 distance between its |SHAP| vector and the reference mean |SHAP|\nvector from the warm-up window. ADWIN raises an alarm when the mean of this signal changes.\n"""\nfrom __future__ import annotations\n\nimport numpy as np\nimport shap\nfrom river import drift\n\n\ndef positive_class_shap(explainer, X: np.ndarray) -> np.ndarray:\n    sv = explainer.shap_values(X, check_additivity=False)\n    sv = np.asarray(sv)\n    if sv.ndim == 3:            # (n, features, classes) in recent SHAP versions\n        return sv[:, :, 1]\n    return sv\n\n\nclass ShapADWIN:\n    def __init__(self, tree_model, X_reference: np.ndarray, delta: float = 0.002,\n                 sample_every: int = 5, chunk: int = 2000):\n        self.explainer = shap.TreeExplainer(tree_model)\n        ref = np.abs(positive_class_shap(self.explainer, X_reference))\n        self.mu_ref = ref.mean(axis=0)\n        self.scale = self.mu_ref.sum() + 1e-12\n        self.delta, self.sample_every, self.chunk = delta, sample_every, chunk\n        self.adwin = drift.ADWIN(delta=delta)\n\n    def signal(self, X: np.ndarray) -> np.ndarray:\n        s = np.abs(positive_class_shap(self.explainer, X))\n        return np.abs(s - self.mu_ref).sum(axis=1) / self.scale\n\n    def run(self, X: np.ndarray) -> tuple[list[int], np.ndarray, np.ndarray]:\n        """Replay X in order; returns alarm positions, sampled positions and signal values."""\n        idx = np.arange(0, len(X), self.sample_every)\n        sig = np.concatenate([self.signal(X[idx[i:i + self.chunk]])\n                              for i in range(0, len(idx), self.chunk)]) if len(idx) else np.array([])\n        alarms = []\n        for pos, v in zip(idx, sig):\n            self.adwin.update(float(v))\n            if self.adwin.drift_detected:\n                alarms.append(int(pos))\n        return alarms, idx, sig\n\n\ndef detection_delay(alarms, t0: int, horizon: int | None = None):\n    """First alarm at or after t0 (in transactions) and number of alarms before t0."""\n    after = [a for a in alarms if a >= t0 and (horizon is None or a < t0 + horizon)]\n    return (after[0] - t0 if after else None), sum(a < t0 for a in alarms)\n',
+    'drift.py': '"""Programmatic drift injection into the real, time-ordered stream (report Section 3.22, O2/O4).\n\nPublic data rarely has labelled natural drift, so three controlled scenarios are injected\n(drift taxonomy of Gama et al., 2014):\n  * abrupt      - from position t0, each of `n_pairs` strong fraud-indicator features is swapped\n                  with a weak (almost uncorrelated) feature for every transaction, so the fraud\n                  signal moves to other columns at once (real concept drift);\n  * gradual     - the same swap, applied with a probability that rises linearly from 0 to 1 over\n                  `width` transactions after t0;\n  * adversarial - from t0, fraud transactions copy the values of their strongest indicator\n                  features from randomly chosen legitimate transactions (camouflage).\nAll randomness is controlled by `seed`, so each seed gives a different but repeatable drift.\n"""\nfrom __future__ import annotations\n\nimport numpy as np\nimport pandas as pd\n\n# Feature pools fixed from the warm-up slice only (8 highest / 8 lowest |corr| with Class).\nTOP_FEATURES = ["V17", "V14", "V12", "V10", "V16", "V3", "V7", "V11"]\nWEAK_FEATURES = ["V15", "V28", "V13", "V24", "V22", "V26", "V25", "V23"]\n\n\ndef _pairs(rng, features, n_pairs, weak=WEAK_FEATURES):\n    strong = rng.choice(features, size=n_pairs, replace=False)\n    other = rng.choice(weak, size=n_pairs, replace=False)\n    return list(zip(strong, other))\n\n\ndef inject(df: pd.DataFrame, kind: str, t0: int, seed: int = 0, width: int = 20_000,\n           n_pairs: int = 3, features=TOP_FEATURES) -> tuple[pd.DataFrame, dict]:\n    """Return a drifted copy of df and a description of what was changed."""\n    if kind == "none":\n        return df.copy(), {"kind": "none"}\n    rng = np.random.default_rng(seed)\n    out = df.copy()\n    n = len(out)\n    pos = np.arange(n)\n    info = {"kind": kind, "t0": int(t0), "seed": seed}\n    if kind in ("abrupt", "gradual"):\n        pairs = _pairs(rng, list(features), n_pairs)\n        if kind == "abrupt":\n            mask = pos >= t0\n        else:\n            p = np.clip((pos - t0) / width, 0, 1)\n            mask = rng.random(n) < p\n            info["width"] = width\n        for a, b in pairs:\n            va, vb = out.loc[mask, a].to_numpy().copy(), out.loc[mask, b].to_numpy().copy()\n            out.loc[mask, a], out.loc[mask, b] = vb, va\n        info["pairs"] = [list(map(str, p)) for p in pairs]\n        info["n_changed"] = int(mask.sum())\n    elif kind == "adversarial":\n        cols = list(features[:4])\n        fraud_after = np.where((pos >= t0) & (out["Class"].to_numpy() == 1))[0]\n        legit = np.where(out["Class"].to_numpy() == 0)[0]\n        donors = rng.choice(legit, size=len(fraud_after), replace=True)\n        out.iloc[fraud_after, [out.columns.get_loc(c) for c in cols]] = \\\n            out.iloc[donors, [out.columns.get_loc(c) for c in cols]].to_numpy()\n        info["camouflaged_features"] = cols\n        info["n_changed"] = int(len(fraud_after))\n    else:\n        raise ValueError(f"unknown drift kind: {kind}")\n    return out, info\n',
+    'experiments.py': '"""Detector comparison on the drifted evaluation stream (objective O4; preview for Chapter 4).\n\nOne frozen batch Random Forest (fitted on the labelled warm-up slice) is monitored by three\ndetectors: ADWIN and DDM on its 0/1 errors, which only arrive after the label delay, and the\nlabel-free SHAP-ADWIN on its TreeSHAP attributions.\n"""\nfrom __future__ import annotations\n\nfrom concurrent.futures import ProcessPoolExecutor\n\nimport numpy as np\n\nfrom . import config, detectors, drift, metrics, models\n\n_D: dict = {}\n\n\ndef _init(warm, evalp, feats, t0, delays, horizon, shap_delta, sample_every):\n    _D.update(warm=warm, evalp=evalp, feats=feats, t0=t0, delays=delays, horizon=horizon,\n              shap_delta=shap_delta, sample_every=sample_every)\n\n\ndef label_arrival_positions(times: np.ndarray, delay_s: float) -> np.ndarray:\n    """Stream position at which each transaction\'s label becomes known (t_j + delay <= t_i)."""\n    return np.searchsorted(times, times + delay_s, side="left")\n\n\ndef error_detector_alarms(errors, arrival, name):\n    det = models.make_detector(name)\n    alarms = []\n    for e, pos in zip(errors, arrival):\n        det.update(int(e))\n        if det.drift_detected:\n            alarms.append(int(pos))\n    return alarms\n\n\ndef run_case(job):\n    kind, seed = job\n    warm, evalp, feats, t0 = _D["warm"], _D["evalp"], _D["feats"], _D["t0"]\n    rf = models.make_batch_rf(seed=seed).fit(warm[feats].to_numpy(), warm.Class.to_numpy())\n    drifted, _ = drift.inject(evalp, kind, t0=t0, seed=seed)\n    X, y, t = drifted[feats].to_numpy(), drifted.Class.to_numpy(), drifted.Time.to_numpy()\n    p = rf.predict_proba(X)[:, 1]\n    err = (p >= config.THRESHOLD).astype(int) != y\n    out = []\n    ref = warm[feats].to_numpy()[np.random.default_rng(seed).choice(len(warm), 2000, replace=False)]\n    sd = detectors.ShapADWIN(rf, ref, delta=_D["shap_delta"], sample_every=_D["sample_every"])\n    shap_alarms, _, _ = sd.run(X)\n    pre = metrics.summarise(y[:t0], p[:t0]); post = metrics.summarise(y[t0:], p[t0:])\n    for dname, dsec in _D["delays"].items():\n        arr = label_arrival_positions(t, dsec)\n        alarms = {"ADWIN": error_detector_alarms(err, arr, "ADWIN"),\n                  "DDM": error_detector_alarms(err, arr, "DDM"),\n                  "SHAP-ADWIN": shap_alarms}\n        for det, al in alarms.items():\n            d, fa = detectors.detection_delay(al, t0, _D["horizon"])\n            out.append({"scenario": kind, "seed": seed, "delay": dname, "detector": det,\n                        "detected": d is not None, "detection_delay_tx": d,\n                        "false_alarms_before_t0": fa, "alarms_total": len(al),\n                        "rf_pr_auc_pre": pre["pr_auc"], "rf_pr_auc_post": post["pr_auc"]})\n    return out\n\n\ndef run_all(warm, evalp, feats, t0, delays, kinds=("none", "abrupt", "gradual", "adversarial"),\n            seeds=config.SEEDS, horizon=50_000, shap_delta=0.002, sample_every=5, workers=5):\n    jobs = [(k, s) for k in kinds for s in seeds]\n    with ProcessPoolExecutor(workers, initializer=_init,\n                             initargs=(warm, evalp, feats, t0, delays, horizon, shap_delta, sample_every)) as ex:\n        return [r for rows in ex.map(run_case, jobs) for r in rows]\n',
+    'features.py': '"""Feature extraction (report Section 3.21).\n\nThe data has no card or customer ID, so per-card aggregates are impossible. Features are:\nhour of day from Time, log Amount, and stream-window features that use ONLY past transactions\n(no look-ahead): transaction count in the previous 60 s, mean Amount of the previous 100\ntransactions and the ratio of the current Amount to that mean. Online standardisation is done\ninside the River pipeline (preprocessing.StandardScaler) for the linear model.\n\n`add_features` (batch, vectorised) and `OnlineFeatures` (one transaction at a time, used by the\nStreamlit demo) must give identical values; tests/test_features.py checks this.\n"""\nfrom __future__ import annotations\n\nfrom collections import deque\n\nimport numpy as np\nimport pandas as pd\n\nfrom . import config\n\nWIN_SECONDS = 60\nWIN_N = 100\nENGINEERED = ["hour", "log_amount", "tx_count_60s", "amt_mean_100", "amt_ratio"]\nMODEL_FEATURES = config.V_COLS + ENGINEERED\n\n\ndef hour_of_day(time_s):\n    return (np.asarray(time_s) // 3600).astype(int) % 24\n\n\ndef add_features(df: pd.DataFrame) -> pd.DataFrame:\n    """Vectorised feature builder. Requires df sorted by Time."""\n    out = df.copy()\n    t = out["Time"].to_numpy()\n    amt = out["Amount"].to_numpy()\n    out["hour"] = hour_of_day(t)\n    out["log_amount"] = np.log1p(amt)\n    idx = np.arange(len(t))\n    # previous transactions with time > t - 60 (strictly earlier rows only)\n    out["tx_count_60s"] = idx - np.searchsorted(t, t - WIN_SECONDS, side="right")\n    prev_mean = pd.Series(amt).shift(1).rolling(WIN_N, min_periods=1).mean()\n    out["amt_mean_100"] = prev_mean.fillna(0.0).to_numpy()\n    out["amt_ratio"] = amt / (out["amt_mean_100"].to_numpy() + 1.0)\n    return out\n\n\nclass OnlineFeatures:\n    """Same features computed one transaction at a time with bounded memory."""\n\n    def __init__(self, win_seconds: int = WIN_SECONDS, win_n: int = WIN_N):\n        self.win_seconds = win_seconds\n        self.times: deque = deque()\n        self.amounts: deque = deque(maxlen=win_n)\n\n    def transform_one(self, x: dict) -> dict:\n        t, a = float(x["Time"]), float(x["Amount"])\n        while self.times and self.times[0] <= t - self.win_seconds:\n            self.times.popleft()\n        mean_prev = float(np.mean(self.amounts)) if self.amounts else 0.0\n        feats = {k: x[k] for k in config.V_COLS}\n        feats.update({\n            "hour": int(t // 3600) % 24,\n            "log_amount": float(np.log1p(a)),\n            "tx_count_60s": len(self.times),\n            "amt_mean_100": mean_prev,\n            "amt_ratio": a / (mean_prev + 1.0),\n        })\n        self.times.append(t)\n        self.amounts.append(a)\n        return feats\n',
+    'metrics.py': '"""Imbalance-aware metrics (UREC2: PR-AUC, G-mean, Precision@k; accuracy is NOT used)."""\nfrom __future__ import annotations\n\nimport numpy as np\nfrom sklearn.metrics import average_precision_score\n\nfrom . import config\n\n\ndef pr_auc(y, scores) -> float:\n    """Area under the precision-recall curve (average precision)."""\n    y = np.asarray(y)\n    if y.sum() == 0:\n        return float("nan")\n    return float(average_precision_score(y, scores))\n\n\ndef g_mean(y, scores, threshold: float = config.THRESHOLD) -> float:\n    """sqrt(TPR * TNR) at a fixed decision threshold."""\n    y = np.asarray(y).astype(int)\n    pred = (np.asarray(scores) >= threshold).astype(int)\n    pos, neg = y == 1, y == 0\n    tpr = pred[pos].mean() if pos.any() else 0.0\n    tnr = (1 - pred[neg]).mean() if neg.any() else 0.0\n    return float(np.sqrt(tpr * tnr))\n\n\ndef precision_at_k(y, scores, k: int = config.PK_K, block: int = config.PK_BLOCK) -> float:\n    """Alert-budget precision: in each block of `block` consecutive transactions the k\n    highest-scored ones are alerted; returns the mean precision over full blocks."""\n    y, s = np.asarray(y), np.asarray(scores)\n    vals = []\n    for start in range(0, len(y) - block + 1, block):\n        yb, sb = y[start:start + block], s[start:start + block]\n        top = np.argsort(-sb, kind="stable")[:k]\n        vals.append(yb[top].mean())\n    return float(np.mean(vals)) if vals else float("nan")\n\n\ndef summarise(y, scores) -> dict:\n    return {"pr_auc": pr_auc(y, scores), "g_mean": g_mean(y, scores),\n            "precision_at_k": precision_at_k(y, scores)}\n',
+    'models.py': '"""Model and detector factories (report Section 3.23, objectives O1, O3, O4)."""\nfrom __future__ import annotations\n\nfrom river import drift, forest, linear_model, preprocessing, tree, optim\nfrom sklearn.ensemble import RandomForestClassifier\n\n\nclass ClassWeighted:\n    """Cost-sensitive wrapper: each fraud label is learnt with weight `fraud_weight`.\n    Without it a Hoeffding Tree on 0.17 % fraud never splits and predicts the majority class."""\n\n    def __init__(self, model, fraud_weight: float = 1.0):\n        self.model, self.fraud_weight = model, fraud_weight\n\n    def learn_one(self, x, y):\n        self.model.learn_one(x, y, w=self.fraud_weight if y == 1 else 1.0)\n\n    def predict_proba_one(self, x):\n        return self.model.predict_proba_one(x)\n\n\ndef make_online(name: str, seed: int = 0, **params):\n    """Online learners from River. Trees need no scaling; the linear model uses online\n    standardisation (running mean/variance) as its first step. HT and LR accept\n    `fraud_weight` (cost-sensitive learning); ARF already re-weights with Poisson(lambda)."""\n    w = params.get("fraud_weight", 1.0)\n    if name == "HT":\n        return ClassWeighted(tree.HoeffdingTreeClassifier(\n            grace_period=params.get("grace_period", 200),\n            delta=params.get("delta", 1e-7),\n            leaf_prediction=params.get("leaf_prediction", "nba")), w)\n    if name == "ARF":\n        return forest.ARFClassifier(\n            n_models=params.get("n_models", 10),\n            grace_period=params.get("grace_period", 50),\n            lambda_value=params.get("lambda_value", 6),\n            seed=seed)\n    if name == "LR":\n        return ClassWeighted(preprocessing.StandardScaler() | linear_model.LogisticRegression(\n            optimizer=optim.SGD(params.get("lr", 0.01))), w)\n    raise ValueError(name)\n\n\ndef make_batch_rf(seed: int = 0, n_estimators: int = 100, max_depth: int = 10):\n    """Batch comparator (O3) and the tree model explained by TreeSHAP (O4)."""\n    return RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth,\n                                  class_weight="balanced_subsample", n_jobs=2,\n                                  random_state=seed)\n\n\ndef make_detector(name: str, **params):\n    """Classic error-rate detectors (baselines for O4)."""\n    if name == "ADWIN":\n        return drift.ADWIN(delta=params.get("delta", 0.002))\n    if name == "DDM":\n        return drift.binary.DDM()\n    raise ValueError(name)\n',
+    'stream.py': '"""Time-ordered stream replay with delayed labels and prequential (test-then-train) evaluation\n(report Sections 3.22-3.24, objectives O1, O2, O5).\n\nFor every transaction, in time order:\n  1. release every label whose transaction time + delay <= current time; the model learns from\n     it and the error-rate detectors (ADWIN, DDM) see its 0/1 error;\n  2. the model scores the current transaction (test) and the transaction joins the queue\n     of labels not yet known (train later).\nWith delay = 0 this is ordinary prequential evaluation. Cross-validation and random splits are\nnever used, because they break the time order (UREC2).\n"""\nfrom __future__ import annotations\n\nfrom collections import deque\nfrom dataclasses import dataclass, field\n\nimport numpy as np\n\nfrom . import config\n\n\n@dataclass\nclass StreamResult:\n    scores: np.ndarray\n    alarms: dict = field(default_factory=dict)      # detector name -> list of stream positions\n    labels_used: int = 0\n\n\ndef prequential(model, X_rows: list[dict], y: np.ndarray, times: np.ndarray,\n                delay_s: float = 0.0, detectors: dict | None = None,\n                threshold: float = config.THRESHOLD) -> StreamResult:\n    detectors = detectors or {}\n    alarms = {k: [] for k in detectors}\n    pending: deque = deque()\n    scores = np.zeros(len(X_rows))\n    used = 0\n    for i, (x, t) in enumerate(zip(X_rows, times)):\n        while pending and pending[0][2] + delay_s <= t:\n            xj, yj, _, pj = pending.popleft()\n            model.learn_one(xj, int(yj))\n            used += 1\n            err = int((pj >= threshold) != yj)\n            for name, det in detectors.items():\n                det.update(err)\n                if det.drift_detected:\n                    alarms[name].append(i)\n        p = model.predict_proba_one(x).get(1, 0.0)\n        scores[i] = p\n        pending.append((x, y[i], t, p))\n    return StreamResult(scores=scores, alarms=alarms, labels_used=used)\n\n\ndef to_rows(df, features) -> list[dict]:\n    return df[features].to_dict("records")\n',
+    'tuning.py': '"""Prequential hyperparameter search on the early warm-up slice (report Section 3.24).\n\nOnly the first WARMUP_FRACTION of the time-ordered stream is used, so later data (where drift is\ninjected and final results are measured) is never seen while tuning. Each configuration is run\nwith every seed and scored with PR-AUC, G-mean and Precision@k (mean +- SD).\n"""\nfrom __future__ import annotations\n\nimport itertools\nimport time\nfrom concurrent.futures import ProcessPoolExecutor\n\nimport numpy as np\nimport pandas as pd\n\nfrom . import config, metrics, models, stream\n\nGRID = {\n    "HT": {"grace_period": [50, 200], "leaf_prediction": ["mc", "nba"], "fraud_weight": [1, 50, 200]},\n    "ARF": {"n_models": [5, 10, 20], "grace_period": [50, 200]},\n    "LR": {"lr": [0.005, 0.01, 0.05], "fraud_weight": [1, 50]},\n}\nDETERMINISTIC = {"HT", "LR"}   # no random component: one run equals every seed\n\n\ndef expand(grid: dict) -> list[tuple[str, dict]]:\n    out = []\n    for name, space in grid.items():\n        keys = list(space)\n        for vals in itertools.product(*(space[k] for k in keys)):\n            out.append((name, dict(zip(keys, vals))))\n    return out\n\n\n_DATA: dict = {}\n\n\ndef _init(X, feats, y, t):\n    """Each worker receives compact arrays and builds its own row dicts (keeps pickling small)."""\n    _DATA.update(rows=[dict(zip(feats, r)) for r in X.tolist()], y=y, t=t)\n\n\ndef _run(job):\n    name, params, seed, delay = job\n    m = models.make_online(name, seed=seed, **params)\n    t0 = time.time()\n    res = stream.prequential(m, _DATA["rows"], _DATA["y"], _DATA["t"], delay_s=delay)\n    out = {"model": name, **{f"p_{k}": v for k, v in params.items()}, "params": str(params),\n           "seed": seed, "delay_s": delay, "seconds": time.time() - t0,\n           **metrics.summarise(_DATA["y"], res.scores)}\n    return out\n\n\ndef search(X, feats, y, t, grid=GRID, seeds=config.SEEDS, delay_s=0.0, workers=6) -> pd.DataFrame:\n    jobs = []\n    for name, params in expand(grid):\n        for s in (seeds[:1] if name in DETERMINISTIC else seeds):\n            jobs.append((name, params, s, delay_s))\n    with ProcessPoolExecutor(workers, initializer=_init, initargs=(X, feats, y, t)) as ex:\n        res = list(ex.map(_run, jobs))\n    df = pd.DataFrame(res)\n    # deterministic models: copy the single run to every seed so mean +- SD is over 5 seeds (SD = 0)\n    extra = []\n    for _, r in df[df.model.isin(DETERMINISTIC)].iterrows():\n        for s in seeds[1:]:\n            rr = r.copy(); rr["seed"] = s; extra.append(rr)\n    if extra:\n        df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True)\n    return df\n\n\ndef summary(df: pd.DataFrame) -> pd.DataFrame:\n    g = df.groupby(["model", "params"])\n    s = g[["pr_auc", "g_mean", "precision_at_k", "seconds"]].agg(["mean", "std"])\n    s.columns = [f"{a}_{b}" for a, b in s.columns]\n    s["n_seeds"] = g.size()\n    return s.reset_index().sort_values(["model", "pr_auc_mean"], ascending=[True, False])\n\n\ndef evaluate(X, feats, y, t, configs: list[tuple[str, dict]], seeds=config.SEEDS,\n             delays=(0.0,), workers=5) -> pd.DataFrame:\n    """Run fixed (tuned) configurations on a stream for every seed and label delay."""\n    jobs = [(n, p, s, d) for n, p in configs for d in delays\n            for s in (seeds[:1] if n in DETERMINISTIC else seeds)]\n    with ProcessPoolExecutor(workers, initializer=_init, initargs=(X, feats, y, t)) as ex:\n        return pd.DataFrame(list(ex.map(_run, jobs)))\n',
+}
+for name, code in MODULES.items():
+    (PKG / name).write_text(code)
+print("Helper package written to", PKG, "->", sorted(MODULES))
+
+# %% Cell 3
+import sys, json, time, platform
+from pathlib import Path
+ROOT = Path.cwd().resolve().parent if Path.cwd().name == "notebooks" else Path.cwd().resolve()
+sys.path.insert(0, str(ROOT / "src"))
+
+import numpy as np, pandas as pd, matplotlib
+import matplotlib.pyplot as plt
+import river, shap, sklearn
+from fraudxai import config, data, cleansing, features, drift, metrics, stream, models, detectors, tuning
+
+FIG = ROOT / "results" / "figures"; FIG.mkdir(parents=True, exist_ok=True)
+RES_FILE = ROOT / "results" / "results.json"
+R = {}                                              # every number reported in Chapter 3
+def save_results():
+    RES_FILE.write_text(json.dumps(R, indent=2, default=float))
+
+plt.rcParams.update({"font.family": "serif", "font.serif": ["Liberation Serif", "Times New Roman"],
+                     "font.size": 10, "axes.titlesize": 10, "figure.dpi": 110, "savefig.dpi": 300,
+                     "savefig.bbox": "tight", "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white", "axes.spines.top": False, "axes.spines.right": False})
+C_LEGIT, C_FRAUD = "#2E7D32", "#C62828"
+pd.set_option("display.width", 140, "display.max_columns", 20, "display.max_colwidth", 90)
+R["environment"] = {"python": platform.python_version(), "river": river.__version__, "shap": shap.__version__,
+                    "scikit_learn": sklearn.__version__, "pandas": pd.__version__, "numpy": np.__version__}
+print(R["environment"])
+
+# %% Cell 4
+path = data.download()
+raw = data.load(path)
+n, n_fraud = len(raw), int(raw.Class.sum())
+R["dataset"] = {"source": "OpenML 1597 (mirror of Kaggle mlg-ulb/creditcardfraud)", "file_md5": data.md5(path),
+                "rows": n, "columns": raw.shape[1], "fraud": n_fraud, "legit": n - n_fraud,
+                "fraud_rate_pct": round(100 * n_fraud / n, 4),
+                "time_span_hours": float(raw.Time.max() / 3600),
+                "matches_published": (n == config.EXPECTED_ROWS) and (n_fraud == config.EXPECTED_FRAUD)}
+save_results(); pd.Series(R["dataset"])
+
+# %% Cell 5
+# Show the loaded dataset
+print("Dataset loaded from:", path)
+print("Shape (rows, columns):", raw.shape)
+print("Fraud cases:", int(raw.Class.sum()), "| Legitimate:", int((raw.Class == 0).sum()))
+raw.head(10)
+
+# %% Cell 6
+desc_cols = ["Time", "Amount", "V17", "V14", "V12", "V10"]
+desc = raw.groupby("Class")[desc_cols].describe().T.unstack(level=1)
+tbl14 = raw[desc_cols].describe().T[["mean", "std", "min", "50%", "max"]]
+tbl14["mean_legit"] = raw[raw.Class == 0][desc_cols].mean()
+tbl14["mean_fraud"] = raw[raw.Class == 1][desc_cols].mean()
+tbl14 = tbl14.round(2)
+R["eda_descriptive"] = tbl14.to_dict(orient="index")
+tbl14
+
+# %% Cell 7
+counts = raw.Class.value_counts().sort_index()
+fig, ax = plt.subplots(figsize=(5.2, 3.0))
+bars = ax.bar(["Legitimate (0)", "Fraud (1)"], counts.values, color=[C_LEGIT, C_FRAUD], width=0.55)
+ax.set_yscale("log"); ax.set_ylabel("Transactions (log scale)")
+for b, v in zip(bars, counts.values):
+    ax.text(b.get_x() + b.get_width() / 2, v * 1.15, f"{v:,}\n({100*v/n:.3f}%)", ha="center", fontsize=9)
+ax.set_ylim(1, counts.max() * 8)
+fig.savefig(FIG / "fig09_class_balance.png"); plt.show()
+R["eda_class_balance"] = {"legit": int(counts[0]), "fraud": int(counts[1]),
+                          "imbalance_ratio_legit_per_fraud": round(counts[0] / counts[1], 1)}
+
+# %% Cell 8
+fig, ax = plt.subplots(figsize=(5.6, 3.2))
+amt = [raw.loc[raw.Class == c, "Amount"] + 1 for c in (0, 1)]
+bp = ax.boxplot(amt, tick_labels=["Legitimate (0)", "Fraud (1)"], widths=0.5, patch_artist=True,
+                flierprops=dict(marker=".", markersize=2, alpha=0.3))
+for patch, col in zip(bp["boxes"], [C_LEGIT, C_FRAUD]):
+    patch.set_facecolor(col); patch.set_alpha(0.55)
+ax.set_yscale("log"); ax.set_ylabel("Amount + 1 (EUR, log scale)")
+fig.savefig(FIG / "fig10_amount_by_class.png"); plt.show()
+amt_stats = raw.groupby("Class").Amount.agg(["median", "mean", "max", lambda s: (s == 0).sum()])
+amt_stats.columns = ["median", "mean", "max", "zero_amount_count"]
+R["eda_amount_by_class"] = amt_stats.round(2).to_dict(orient="index")
+amt_stats.round(2)
+
+# %% Cell 9
+hours = (raw.Time // 3600).astype(int)                # elapsed hour 0-47 (two days)
+per_hour = raw.groupby([hours, "Class"]).size().unstack(fill_value=0)
+rate = 100 * per_hour[1] / per_hour.sum(axis=1)
+fig, ax1 = plt.subplots(figsize=(6.2, 3.2))
+ax1.bar(per_hour.index, per_hour[0], color=C_LEGIT, alpha=0.6, label="Legitimate per hour")
+ax1.set_xlabel("Elapsed hour since first transaction (0-47)"); ax1.set_ylabel("Legitimate transactions")
+ax2 = ax1.twinx(); ax2.spines["right"].set_visible(True)
+ax2.plot(per_hour.index, rate, color=C_FRAUD, marker="o", ms=2.5, lw=1.2, label="Fraud rate (%)")
+ax2.set_ylabel("Fraud rate (%)")
+h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+ax1.legend(h1 + h2, l1 + l2, loc="upper center", fontsize=8, frameon=False, ncol=2)
+fig.savefig(FIG / "fig11_transactions_per_hour.png"); plt.show()
+R["eda_per_hour"] = {"min_tx_per_hour": int(per_hour.sum(axis=1).min()), "max_tx_per_hour": int(per_hour.sum(axis=1).max()),
+                     "max_fraud_rate_pct": round(float(rate.max()), 3), "hour_of_max_fraud_rate": int(rate.idxmax()),
+                     "mean_fraud_rate_pct": round(float(rate.mean()), 3)}
+R["eda_per_hour"]
+
+# %% Cell 10
+corr = raw.drop(columns="Time").corr()["Class"].drop("Class")
+top = corr.abs().sort_values(ascending=False).head(10).index.tolist()
+cm = raw[top + ["Class"]].corr()
+fig, ax = plt.subplots(figsize=(5.6, 4.6))
+im = ax.imshow(cm.values, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(cm)), cm.columns, rotation=90, fontsize=8); ax.set_yticks(range(len(cm)), cm.columns, fontsize=8)
+for i in range(len(cm)):
+    for j in range(len(cm)):
+        ax.text(j, i, f"{cm.values[i, j]:.2f}", ha="center", va="center", fontsize=6)
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Pearson r")
+fig.savefig(FIG / "fig12_correlation_heatmap.png"); plt.show()
+R["eda_corr_with_class_top10"] = corr[top].round(3).to_dict()
+corr[top].round(3)
+
+# %% Cell 11
+save_results()
+
+# %% Cell 12
+audit = cleansing.audit_table(raw)
+R["data_audit"] = {"columns": len(audit), "total_missing": int(audit.missing.sum()),
+                   "dtypes": audit.dtype.value_counts().to_dict()}
+audit.round(2).head(8)
+
+# %% Cell 13
+# Validation rules R1-R9 on the raw table (same rules as the unit-tested module)
+t = raw.Time
+checks = {
+    "R1 schema: 31 expected columns": len(set(config.RAW_COLS) ^ set(raw.columns)),
+    "R2 all features numeric": int((~raw.dtypes.map(pd.api.types.is_numeric_dtype)).sum()),
+    "R3 no missing values":    int(raw.isna().sum().sum()),
+    "R4 Class in {0, 1}":      int((~raw.Class.isin([0, 1])).sum()),
+    "R5 0 <= Time <= 172,800 s and sorted":
+        int(((t < 0) | (t > config.MAX_TIME_S)).sum() + (t.diff() < 0).sum()),
+    "R6 Amount >= 0":          int((raw.Amount < 0).sum()),
+    "R7 V1-V28, Amount finite": int((~np.isfinite(raw[config.V_COLS + ["Amount"]])).sum().sum()),
+    "R8 exact duplicate rows": int(raw.duplicated().sum()),
+    "R9 Amount == 0":          int((raw.Amount == 0).sum()),
+}
+action = ["stop if > 0"] * 4 + ["sort by Time", "stop if > 0", "stop if > 0",
+                                "drop, keep first", "keep, flag"]
+rules = pd.DataFrame({"violations": list(checks.values()), "action": action}, index=list(checks))
+assert rules.violations.tolist() == [r.violations for r in cleansing.validate(raw)]
+rules
+
+# %% Cell 14
+# Cleansing: stable sort by Time, drop exact duplicates (keep first), no imputation or capping
+df = raw.sort_values("Time", kind="stable").drop_duplicates(keep="first").reset_index(drop=True)
+clean_log = {"rows_before": len(raw), "fraud_before": int(raw.Class.sum()),
+             "rows_after": len(df), "fraud_after": int(df.Class.sum()),
+             "duplicates_dropped": len(raw) - len(df), "fraud_duplicates_dropped": int(raw.Class.sum() - df.Class.sum())}
+assert df.equals(cleansing.clean(raw)[0])            # same result as the tested module
+R["validation_rules"] = rules.reset_index(names="rule").to_dict(orient="records"); R["cleansing"] = clean_log
+save_results(); pd.Series(clean_log)
+
+# %% Cell 15
+# Look-back features: each value uses the current and EARLIER transactions only
+t, amt = df.Time.to_numpy(), df.Amount.to_numpy()
+fe = df.copy()
+fe["hour"] = (t // 3600).astype(int) % 24             # hour of day from Time (s)
+fe["log_amount"] = np.log1p(amt)                      # reduces the skew of Amount
+# stream velocity: earlier transactions in the previous 60 seconds
+fe["tx_count_60s"] = np.arange(len(t)) - np.searchsorted(t, t - 60, side="right")
+# mean Amount of the previous 100 transactions, and the current Amount relative to it
+prev = pd.Series(amt).shift(1).rolling(100, min_periods=1).mean()
+fe["amt_mean_100"] = prev.fillna(0.0).to_numpy()
+fe["amt_ratio"] = amt / (fe["amt_mean_100"] + 1.0)
+same = np.allclose(fe[features.ENGINEERED], features.add_features(df)[features.ENGINEERED])
+print("matches tested module features.add_features:", same)
+fe[features.ENGINEERED].describe().T.round(3)
+
+# %% Cell 16
+eng = fe[features.ENGINEERED + ["Class"]]
+tbl17 = eng.groupby("Class")[features.ENGINEERED].mean().T.round(3)
+tbl17.columns = ["mean_legit", "mean_fraud"]
+R["features"] = {"model_features": features.MODEL_FEATURES, "n_model_features": len(features.MODEL_FEATURES),
+                 "engineered_means_by_class": tbl17.to_dict(orient="index")}
+# check that the online (one-at-a-time) builder gives the same values as the batch builder
+online = features.OnlineFeatures(); sample = df.iloc[:5000].to_dict("records")
+on = pd.DataFrame([online.transform_one(x) for x in sample])[features.ENGINEERED]
+diff = float((on - fe.iloc[:5000][features.ENGINEERED].reset_index(drop=True)).abs().max().max())
+R["features"]["online_vs_batch_max_abs_diff_first_5000"] = float(diff)
+save_results(); print("max |online - batch| on first 5,000 rows:", diff); tbl17
+
+# %% Cell 17
+n_warm = int(len(fe) * config.WARMUP_FRACTION)
+warm, evalp = fe.iloc[:n_warm].reset_index(drop=True), fe.iloc[n_warm:].reset_index(drop=True)
+t0 = len(evalp) // 2
+DELAYS = {"none (0 s)": 0, "1 hour": 3600, "6 hours": 21600}
+# label backlog: number of earlier transactions whose label is still unknown (inside the delay window)
+t_eval = evalp.Time.to_numpy(); idx = np.arange(len(t_eval))
+backlog = {k: float(np.mean(idx - np.searchsorted(t_eval, t_eval - d, side="right"))) if d else 0.0
+           for k, d in DELAYS.items()}
+R["stream"] = {"warmup_rows": n_warm, "warmup_fraud": int(warm.Class.sum()), "warmup_end_hour": float(warm.Time.iloc[-1] / 3600),
+               "eval_rows": len(evalp), "eval_fraud": int(evalp.Class.sum()), "drift_t0_in_eval": int(t0),
+               "drift_t0_hour": float(evalp.Time.iloc[t0] / 3600), "delays_s": DELAYS,
+               "mean_unlabelled_backlog": backlog,
+               "drift_pool_matches_warmup_top8": set(drift.TOP_FEATURES) == set(warm.drop(columns="Time")[config.V_COLS + ["Class"]].corr()["Class"].drop("Class").abs().nlargest(8).index)}
+pd.Series(R["stream"])
+
+# %% Cell 18
+scen = []
+for kind in ["abrupt", "gradual", "adversarial"]:
+    _, info = drift.inject(evalp, kind, t0=t0, seed=0)
+    scen.append({"scenario": kind, **{k: v for k, v in info.items() if k not in ("kind", "seed")}})
+warm_top8 = warm.drop(columns="Time")[config.V_COLS + ["Class"]].corr()["Class"].drop("Class").abs().nlargest(8).index.tolist()
+R["drift_scenarios_seed0"] = scen; R["drift_feature_pool_from_warmup"] = warm_top8
+save_results(); print("top-8 |corr| features in warm-up:", warm_top8); pd.DataFrame(scen)
+
+# %% Cell 19
+FEATS = features.MODEL_FEATURES
+warm_rows, y_w, t_w = stream.to_rows(warm, FEATS), warm.Class.to_numpy(), warm.Time.to_numpy()
+base = []
+for name in ["HT", "LR", "ARF"]:
+    for seed in (config.SEEDS if name == "ARF" else [0]):
+        t_start = time.time()
+        res = stream.prequential(models.make_online(name, seed=seed), warm_rows, y_w, t_w)
+        base.append({"model": name, "seed": seed, "seconds": time.time() - t_start, **metrics.summarise(y_w, res.scores)})
+base = pd.DataFrame(base)
+tbl_base = base.groupby("model")[["pr_auc", "g_mean", "precision_at_k", "seconds"]].agg(["mean", "std"]).fillna(0.0).round(4)
+tbl_base["runs"] = base.groupby("model").size()          # HT and LR are deterministic: SD = 0 by construction
+R["baselines_warmup_default_params"] = {m: {f"{a}_{b}": float(v) for (a, b), v in row.items()}
+                                        for m, row in tbl_base.iterrows()}
+save_results(); tbl_base
+
+# %% Cell 20
+# Prequential (test-then-train) grid search on the warm-up slice; 5 seeds per setting
+for m, space in tuning.GRID.items():
+    print(m, space)
+t_start = time.time()
+runs = tuning.search(warm[FEATS].to_numpy(), FEATS, y_w, t_w, workers=2)  # parallel runs
+summ = tuning.summary(runs)                                     # mean and SD over seeds
+best = summ.loc[summ.groupby("model").pr_auc_mean.idxmax()]     # select on PR-AUC
+fmt = lambda m: best[m + "_mean"].map("{:.3f}".format) + " ± " + best[m + "_std"].map("{:.3f}".format)
+table20 = pd.DataFrame({"model": best.model, "best setting": best.params, "PR-AUC": fmt("pr_auc"),
+                        "G-mean": fmt("g_mean"), "P@k": fmt("precision_at_k")}).set_index("model")
+R["tuning_runtime_s"] = time.time() - t_start
+R["tuning_grid"] = tuning.GRID
+R["tuning_all"] = summ.round(4).to_dict(orient="records")
+R["tuning_best"] = best.drop(columns=["seconds_mean", "seconds_std"]).round(4).to_dict(orient="records")
+save_results(); table20
+
+# %% Cell 21
+summ.round(4)   # every configuration (Table 20 source)
+
+# %% Cell 22
+arf = runs[runs.model == "ARF"]
+fig, ax = plt.subplots(figsize=(5.6, 3.2))
+for gp, mk, col in [(50, "o", "#1565C0"), (200, "s", "#EF6C00")]:
+    g = arf[arf.p_grace_period == gp].groupby("p_n_models").pr_auc.agg(["mean", "std"])
+    ax.errorbar(g.index, g["mean"], yerr=g["std"], marker=mk, color=col, capsize=3, lw=1.2, label=f"grace_period = {gp}")
+ax.set_xlabel("ARF ensemble size (n_models)"); ax.set_ylabel("Prequential PR-AUC (mean ± SD, 5 seeds)")
+ax.set_xticks(sorted(arf.p_n_models.unique())); ax.legend(frameon=False, fontsize=8)
+fig.savefig(FIG / "fig13_tuning_curve.png"); plt.show()
+
+# %% Cell 23
+import ast
+best_cfg = [(r["model"], ast.literal_eval(r["params"])) for r in R["tuning_best"]]
+y_e, t_e = evalp.Class.to_numpy(), evalp.Time.to_numpy()
+t_start = time.time()
+ev = tuning.evaluate(evalp[FEATS].to_numpy(), FEATS, y_e, t_e, best_cfg, delays=(0.0, 21600.0), workers=2)
+ev_s = ev.groupby(["model", "delay_s"])[["pr_auc", "g_mean", "precision_at_k", "seconds"]].agg(["mean", "std"]).fillna(0.0).round(4)
+ev_s["runs"] = ev.groupby(["model", "delay_s"]).size()
+# frozen batch Random Forest trained on the warm-up slice (O3 comparator)
+rf_rows = []
+for seed in config.SEEDS:
+    rf = models.make_batch_rf(seed=seed).fit(warm[FEATS].to_numpy(), y_w)
+    rf_rows.append({"seed": seed, **metrics.summarise(y_e, rf.predict_proba(evalp[FEATS].to_numpy())[:, 1])})
+rf_df = pd.DataFrame(rf_rows)
+R["preview_eval_online"] = {f"{m}|delay={int(d)}s": {f"{a}_{b}": float(v) for (a, b), v in row.items()} for (m, d), row in ev_s.iterrows()}
+R["preview_eval_batch_rf_frozen"] = rf_df[["pr_auc", "g_mean", "precision_at_k"]].agg(["mean", "std"]).round(4).to_dict()
+R["preview_eval_runtime_s"] = time.time() - t_start
+save_results(); display(ev_s); rf_df[["pr_auc", "g_mean", "precision_at_k"]].agg(["mean", "std"]).round(4)
+
+# %% Cell 24
+from fraudxai import experiments
+det = pd.DataFrame(experiments.run_all(warm, evalp, FEATS, t0, {"0 s": 0, "1 h": 3600, "6 h": 21600}, workers=2))
+det_s = det.groupby(["scenario", "delay", "detector"]).agg(
+    detection_rate=("detected", "mean"), delay_mean=("detection_delay_tx", "mean"), delay_sd=("detection_delay_tx", "std"),
+    false_alarms_mean=("false_alarms_before_t0", "mean"), rf_pr_auc_post=("rf_pr_auc_post", "mean")).round(3).reset_index()
+R["preview_detectors"] = det_s.to_dict(orient="records")
+R["preview_detectors_settings"] = {"horizon_tx": 50000, "shap_delta": 0.002, "adwin_delta": 0.002, "shap_sample_every": 5,
+                                   "reference_rows": 2000, "rf": "n_estimators=100, max_depth=10, balanced_subsample"}
+save_results(); det_s
+
+# %% Cell 25
+import sys, ast, json, pickle, time
+from pathlib import Path
+ROOT = Path.cwd().resolve().parent if Path.cwd().name == "notebooks" else Path.cwd().resolve()
+sys.path.insert(0, str(ROOT / "src"))
+import numpy as np
+from fraudxai import config, data, cleansing, features, models, stream
+R = json.loads((ROOT / "results" / "results.json").read_text())
+df_s, _ = cleansing.clean(data.load(data.download()))
+warm_s = features.add_features(df_s.iloc[: int(len(df_s) * config.WARMUP_FRACTION)].reset_index(drop=True))
+F, SEED = features.MODEL_FEATURES, 0
+rf_s = models.make_batch_rf(seed=SEED).fit(warm_s[F].to_numpy(), warm_s.Class.to_numpy())
+ref_s = warm_s[F].to_numpy()[np.random.default_rng(SEED).choice(len(warm_s), 2000, replace=False)]
+arf_p = ast.literal_eval(next(r["params"] for r in R["tuning_best"] if r["model"] == "ARF"))
+arf_s = models.make_online("ARF", seed=SEED, **arf_p)
+stream.prequential(arf_s, stream.to_rows(warm_s, F), warm_s.Class.to_numpy(), warm_s.Time.to_numpy())
+out = ROOT / "results" / "models"; out.mkdir(parents=True, exist_ok=True)
+bundle = {"seed": SEED, "features": F, "rf": rf_s, "shap_reference": ref_s, "arf": arf_s, "arf_params": arf_p,
+          "trained_on": f"warm-up slice, {len(warm_s):,} transactions", "saved": time.strftime("%Y-%m-%d %H:%M %Z")}
+(out / "fraud_pipeline.pkl").write_bytes(pickle.dumps(bundle))
+print("saved", out / "fraud_pipeline.pkl", f"{(out / 'fraud_pipeline.pkl').stat().st_size / 1e6:.1f} MB", "| ARF params:", arf_p)
