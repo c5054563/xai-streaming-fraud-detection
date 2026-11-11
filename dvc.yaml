@@ -1,0 +1,14 @@
+# DVC pipeline (no remote configured; raw data is never pushed).
+# `dvc repro` re-runs the analysis notebook when the data, code or notebook change.
+stages:
+  analysis:
+    cmd: jupyter nbconvert --to notebook --execute --inplace notebooks/Dinesh_Gudapuri_C5054563_Fraud_XAI.ipynb
+    deps:
+      - data/creditcard.parquet
+      - src/fraudxai
+      - notebooks/Dinesh_Gudapuri_C5054563_Fraud_XAI.ipynb
+    outs:
+      - results/results.json:
+          cache: false
+      - results/figures:
+          cache: false

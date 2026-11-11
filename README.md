@@ -77,6 +77,14 @@ The notebook downloads the dataset into `data/` on first run and writes figures 
 `results/results.json`. Runtime: about 20–30 minutes on an 8-core machine (the hyperparameter
 search and the detector comparison run in parallel processes).
 
+## Data versioning (DVC)
+
+`data/creditcard.parquet.dvc` records the MD5 hash and size of the raw file, so the exact data
+version is traceable without committing the data. `dvc.yaml` defines one `analysis` stage that
+re-runs the notebook when the data, `src/` or the notebook change (`dvc repro`). No DVC remote is
+configured and no data is pushed; after a fresh clone, run the notebook (it downloads the data)
+and `dvc status` confirms the hash matches.
+
 ## Method summary
 
 * Time-ordered replay of the cleaned stream (stable sort by `Time`, exact duplicates dropped).
@@ -90,4 +98,4 @@ search and the detector comparison run in parallel processes).
 ## Tools
 
 Python, River (BSD-3-Clause), SHAP (MIT), scikit-learn (BSD-3-Clause), pandas, NumPy, Matplotlib,
-Jupyter, pytest, Streamlit (Apache-2.0), Git/GitHub.
+Jupyter, pytest, Streamlit (Apache-2.0), DVC (Apache-2.0), Git/GitHub.

@@ -11,3 +11,4 @@ nbconvert
 nbstripout           # strips notebook outputs before commit
 pytest>=8
 streamlit>=1.35      # live demonstration dashboard (Apache-2.0)
+dvc>=3.0             # data version pointer + pipeline stage (Apache-2.0)
