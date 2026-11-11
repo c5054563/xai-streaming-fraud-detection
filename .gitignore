@@ -1,5 +1,7 @@
 # Raw data is never committed (UREC2: ODbL/DbCL dataset, stored on SHU F drive only)
-data/
+data/*
+!data/*.dvc
+!data/.gitignore
 *.csv
 *.arff
 *.pq
