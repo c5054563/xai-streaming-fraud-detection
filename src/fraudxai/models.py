@@ -5,14 +5,30 @@ from river import drift, forest, linear_model, preprocessing, tree, optim
 from sklearn.ensemble import RandomForestClassifier
 
 
+class ClassWeighted:
+    """Cost-sensitive wrapper: each fraud label is learnt with weight `fraud_weight`.
+    Without it a Hoeffding Tree on 0.17 % fraud never splits and predicts the majority class."""
+
+    def __init__(self, model, fraud_weight: float = 1.0):
+        self.model, self.fraud_weight = model, fraud_weight
+
+    def learn_one(self, x, y):
+        self.model.learn_one(x, y, w=self.fraud_weight if y == 1 else 1.0)
+
+    def predict_proba_one(self, x):
+        return self.model.predict_proba_one(x)
+
+
 def make_online(name: str, seed: int = 0, **params):
     """Online learners from River. Trees need no scaling; the linear model uses online
-    standardisation (running mean/variance) as its first step."""
+    standardisation (running mean/variance) as its first step. HT and LR accept
+    `fraud_weight` (cost-sensitive learning); ARF already re-weights with Poisson(lambda)."""
+    w = params.get("fraud_weight", 1.0)
     if name == "HT":
-        return tree.HoeffdingTreeClassifier(
+        return ClassWeighted(tree.HoeffdingTreeClassifier(
             grace_period=params.get("grace_period", 200),
             delta=params.get("delta", 1e-7),
-            leaf_prediction=params.get("leaf_prediction", "nba"))
+            leaf_prediction=params.get("leaf_prediction", "nba")), w)
     if name == "ARF":
         return forest.ARFClassifier(
             n_models=params.get("n_models", 10),
@@ -20,8 +36,8 @@ def make_online(name: str, seed: int = 0, **params):
             lambda_value=params.get("lambda_value", 6),
             seed=seed)
     if name == "LR":
-        return preprocessing.StandardScaler() | linear_model.LogisticRegression(
-            optimizer=optim.SGD(params.get("lr", 0.01)))
+        return ClassWeighted(preprocessing.StandardScaler() | linear_model.LogisticRegression(
+            optimizer=optim.SGD(params.get("lr", 0.01))), w)
     raise ValueError(name)
 
 

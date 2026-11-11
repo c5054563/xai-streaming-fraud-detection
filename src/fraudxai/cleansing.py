@@ -41,7 +41,7 @@ def audit_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def validate(df: pd.DataFrame) -> list[RuleResult]:
-    """Apply validation rules R1-R8 and count violations (nothing is changed here)."""
+    """Apply validation rules R1-R9 and count violations (nothing is changed here)."""
     feats = [c for c in df.columns if c != config.TARGET]
     num = df[feats].apply(pd.to_numeric, errors="coerce")
     return [
