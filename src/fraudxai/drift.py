@@ -2,8 +2,9 @@
 
 Public data rarely has labelled natural drift, so three controlled scenarios are injected
 (drift taxonomy of Gama et al., 2014):
-  * abrupt      - from position t0, pairs of strong fraud-indicator features are swapped for every
-                  transaction (the feature->label relation changes at once: real concept drift);
+  * abrupt      - from position t0, each of `n_pairs` strong fraud-indicator features is swapped
+                  with a weak (almost uncorrelated) feature for every transaction, so the fraud
+                  signal moves to other columns at once (real concept drift);
   * gradual     - the same swap, applied with a probability that rises linearly from 0 to 1 over
                   `width` transactions after t0;
   * adversarial - from t0, fraud transactions copy the values of their strongest indicator
@@ -15,12 +16,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-TOP_FEATURES = ["V17", "V14", "V12", "V10", "V16", "V3", "V7", "V11"]  # set from EDA (|corr| with Class)
+# Feature pools fixed from the warm-up slice only (8 highest / 8 lowest |corr| with Class).
+TOP_FEATURES = ["V17", "V14", "V12", "V10", "V16", "V3", "V7", "V11"]
+WEAK_FEATURES = ["V15", "V28", "V13", "V24", "V22", "V26", "V25", "V23"]
 
 
-def _pairs(rng, features, n_pairs):
-    chosen = rng.choice(features, size=2 * n_pairs, replace=False)
-    return [(chosen[2 * i], chosen[2 * i + 1]) for i in range(n_pairs)]
+def _pairs(rng, features, n_pairs, weak=WEAK_FEATURES):
+    strong = rng.choice(features, size=n_pairs, replace=False)
+    other = rng.choice(weak, size=n_pairs, replace=False)
+    return list(zip(strong, other))
 
 
 def inject(df: pd.DataFrame, kind: str, t0: int, seed: int = 0, width: int = 20_000,
