@@ -1,0 +1,5 @@
+outs:
+- md5: 1593844f40edbdabaf5bddec4649e1c4
+  size: 73231184
+  hash: md5
+  path: creditcard.parquet
