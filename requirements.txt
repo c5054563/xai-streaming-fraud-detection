@@ -1,0 +1,13 @@
+# Python 3.11+ (developed and tested on Python 3.13)
+numpy>=2.0
+pandas>=2.2
+pyarrow>=15
+scikit-learn>=1.5
+river>=0.22          # online learning + ADWIN/DDM (BSD-3-Clause)
+shap>=0.46           # TreeSHAP explanations (MIT)
+matplotlib>=3.8
+jupyter
+nbconvert
+nbstripout           # strips notebook outputs before commit
+pytest>=8
+streamlit>=1.35      # live demonstration dashboard (Apache-2.0)

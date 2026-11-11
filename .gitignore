@@ -1,0 +1,21 @@
+# Raw data is never committed (UREC2: ODbL/DbCL dataset, stored on SHU F drive only)
+data/
+*.csv
+*.arff
+*.pq
+*.parquet
+# Generated outputs, figures, result files and report assets are not committed
+results/
+ch3_assets/
+*.png
+*.json
+!.vscode/*.json
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+venv/
+.venv/
+.streamlit/secrets.toml
+.dvc/tmp
