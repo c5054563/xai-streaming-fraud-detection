@@ -11,6 +11,7 @@ the (delayed) labels arrive.
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 import time
 from collections import deque
@@ -31,15 +32,24 @@ FEATS = features.MODEL_FEATURES
 
 
 # ----------------------------------------------------------------------------- data and models
-@st.cache_resource(show_spinner="Loading dataset and training the warm-up model...")
+MODEL_FILE = config.RESULTS_DIR / "models" / "fraud_pipeline.pkl"
+
+
+@st.cache_resource(show_spinner="Loading dataset and the trained model...")
 def load_pipeline(seed: int):
+    """Load the model saved by the notebook (results/models/fraud_pipeline.pkl); if it is
+    missing, train the same warm-up Random Forest here so the demo still runs."""
     df, clean_log = cleansing.clean(data.load(data.download()))
     n_warm = int(len(df) * config.WARMUP_FRACTION)
     raw_warm, raw_eval = df.iloc[:n_warm].reset_index(drop=True), df.iloc[n_warm:].reset_index(drop=True)
+    if MODEL_FILE.exists():
+        saved = pickle.loads(MODEL_FILE.read_bytes())
+        if saved.get("seed") == seed and saved.get("features") == FEATS:
+            return raw_warm, raw_eval, saved["rf"], saved["shap_reference"], saved.get("arf"), "saved notebook model"
     warm = features.add_features(raw_warm)
     rf = models.make_batch_rf(seed=seed).fit(warm[FEATS].to_numpy(), warm.Class.to_numpy())
     ref = warm[FEATS].to_numpy()[np.random.default_rng(seed).choice(len(warm), 2000, replace=False)]
-    return raw_warm, raw_eval, rf, ref, clean_log
+    return raw_warm, raw_eval, rf, ref, None, "trained in the app (no saved model for this seed)"
 
 
 def tuned_arf_params() -> dict:
@@ -64,14 +74,15 @@ drift_after = st.sidebar.slider("Drift starts after (transactions)", 1_000, 40_0
 batch = st.sidebar.select_slider("Transactions per refresh", [250, 500, 1000, 2000], value=1000)
 pause = st.sidebar.slider("Pause per refresh (s)", 0.0, 1.0, 0.1)
 threshold = st.sidebar.slider("Alert threshold", 0.1, 0.9, config.THRESHOLD, step=0.05)
-run_arf = st.sidebar.checkbox("Also score with online ARF (River)", value=False)
+run_arf = st.sidebar.checkbox("Also score with online ARF (River, warm-up trained if saved)", value=False)
 start = st.sidebar.button("Start replay", type="primary")
 
 st.title("XAI-Guided Drift-Adaptive Streaming Fraud Detection")
 st.caption("Dinesh Gudapuri (C5054563), Sheffield Hallam University. Data: ULB/Worldline credit card "
            "transactions (Dal Pozzolo et al.), ODbL v1.0 / DbCL v1.0. Drift is injected programmatically.")
 
-raw_warm, raw_eval, rf, ref, clean_log = load_pipeline(int(seed))
+raw_warm, raw_eval, rf, ref, saved_arf, model_source = load_pipeline(int(seed))
+st.sidebar.caption(f"Model: {model_source}")
 explainer_det = detectors.ShapADWIN(rf, ref, delta=0.002, sample_every=5)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -93,7 +104,9 @@ stream_df, drift_info = drift.inject(stream_df, scenario, t0=drift_after, seed=i
 online = features.OnlineFeatures()
 for x in raw_warm.iloc[-200:].to_dict("records"):      # prime the window features with recent history
     online.transform_one(x)
-arf = models.make_online("ARF", seed=int(seed), **tuned_arf_params()) if run_arf else None
+import copy
+arf = (copy.deepcopy(saved_arf) if saved_arf is not None
+       else models.make_online("ARF", seed=int(seed), **tuned_arf_params())) if run_arf else None
 err_dets = {"ADWIN": models.make_detector("ADWIN"), "DDM": models.make_detector("DDM")}
 pending: deque = deque()                                 # (time, label, prediction, feats)
 scores, arf_scores, sig_pos, sig_val, alarms, alerts = [], [], [], [], [], []
