@@ -37,7 +37,7 @@ lists every change for an objective.
 ```
 src/fraudxai/   config, data loading, cleansing, features, stream replay, drift injection,
                 metrics, models, detectors, tuning, detector experiments
-notebooks/      Dinesh_Gudapuri_C5054563_Fraud_XAI.ipynb (outputs stripped on commit)
+notebooks/      Dinesh_Gudapuri_C5054563_Fraud_XAI.ipynb (committed with executed outputs, river 0.26.1)
 tests/          pytest unit and integration tests
 app/            streamlit_app.py: live demonstration dashboard
 data/           raw dataset (git-ignored, never committed)
